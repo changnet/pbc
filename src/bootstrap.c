@@ -237,6 +237,7 @@ _set_int32_array(struct _pattern_field * f) {
 	f->ctype = CTYPE_ARRAY;
 }
 
+// 设置offset是因为后面处理各个field时可以直接从offset取内存,无需理会field的类型
 #define SET_PATTERN(pat , idx , pat_type, field_name , type) \
 	pat->f[idx].id = idx+1 ; \
 	pat->f[idx].offset = offsetof(struct pat_type, field_name);	\
@@ -247,6 +248,7 @@ _set_int32_array(struct _pattern_field * f) {
 
 static int
 register_internal(struct pbc_env * p, struct pbc_slice *slice) {
+	// 手动注册struct field_t的各个变量到pattern
 	struct pbc_pattern * FIELD_T =  _pbcP_new(p,8);
 	F(0,name,string);
 	F(1,id,int32);
@@ -257,6 +259,7 @@ register_internal(struct pbc_env * p, struct pbc_slice *slice) {
 	F(6,default_string,string);
 	F(7,default_real,double);
 
+	// 手动注册struct file_t的各个变量到pattern
 	struct pbc_pattern * FILE_T =  _pbcP_new(p,10);
 
 	D(0,name,string);
@@ -271,6 +274,7 @@ register_internal(struct pbc_env * p, struct pbc_slice *slice) {
 
 	int ret = 0;
 
+	// 把slice中的数据解析到file结构体中(slice就是按protobuf encoding的二进制文件)
 	struct file_t file;
 	int r = pbc_pattern_unpack(FILE_T, slice, &file);
 	if (r != 0) {
@@ -278,6 +282,7 @@ register_internal(struct pbc_env * p, struct pbc_slice *slice) {
 		goto _return;
 	}
 
+	// 把解析到的enum message全部放到env中
 	_pbcM_sp_insert(p->files , (const char *)file.name.buffer, NULL);
 
 	pbc_array queue;
@@ -298,6 +303,11 @@ _return:
 
 void 
 _pbcB_init(struct pbc_env * p) {
+	// pb文件本身就是按protobuf encoding规则序列化出来的二进制文件
+	// 因此也需要像解析其他protobuf流一样解析
+	// pbc_descriptor 对应google protobuf源码中的src\google\protobuf\descriptor.proto文件
+	// 但应该是被精简过的，只包含google.protobuf.FileDescriptorSet google.protobuf.FileDescriptorProto
+	// 两个message,结构对应本文件开头那段注释的proto
 	struct pbc_slice slice = { pbc_descriptor,sizeof(pbc_descriptor) };
 	register_internal(p,&slice);
 }

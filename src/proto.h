@@ -48,6 +48,7 @@ struct _enum {
 	pbc_var default_v;
 };
 
+// pbc环境管理，记录所有注册过的descriptor file
 struct pbc_env {
 	struct map_sp * files;	// string -> void *
 	struct map_sp * enums;	// string -> _enum

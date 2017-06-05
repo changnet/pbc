@@ -826,12 +826,13 @@ pbc_pattern_unpack(struct pbc_pattern *pat, struct pbc_slice *s, void * output) 
 	memset(field, 0, pat->count * sizeof(bool));
 
 	int i;
-	int fc = 0;
+	int fc = 0; // 记录已处理的field count
 
+	// 将pb文件解析出来的field与pattern中的field一一对应
 	for (i=0;i<ctx->number;i++) {
 		struct _pattern_field * f = bsearch_pattern(pat, ctx->a[i].wire_id >> 3);
 		if (f) {
-			int index = f - pat->f;
+			int index = f - pat->f;// 这个field在pattern->field数组中的下标
 			if (field[index] == false) {
 				field[index] = true;
 				++fc;
@@ -841,6 +842,7 @@ pbc_pattern_unpack(struct pbc_pattern *pat, struct pbc_slice *s, void * output) 
 				}
 			}
 			char * out = (char *)output + f->offset;
+			// 把从pbc_ctx解析出来的值放到out里去
 			if (unpack_field(f->ctype , f->ptype , ctx->buffer , &ctx->a[i], out) < 0) {
 				int j;
 				for (j=0;j<pat->count;j++) {
@@ -856,6 +858,8 @@ pbc_pattern_unpack(struct pbc_pattern *pat, struct pbc_slice *s, void * output) 
 		}
 	}
 	_pbcC_close(_ctx);
+
+	// 如果有部分值在ctx中不存在(optional类型)，则使用默认值
 	if (fc != pat->count) {
 		for (i=0;i<pat->count;i++) {
 			if (field[i] == false) {

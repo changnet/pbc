@@ -12,12 +12,15 @@
 
 #define INNER_ATOM ((PBC_CONTEXT_CAP - sizeof(struct context)) / sizeof(struct atom))
 
+// 解析一个wiretype，编码方式详见https://developers.google.com/protocol-buffers/docs/encoding
 static char * 
 wiretype_decode(uint8_t *buffer, int cap , struct atom *a , int start)
 {
 	uint8_t temp[10];
 	struct longlong r;
 	int len;
+	// varint编码中,一个varint最大是10byte，如果当前buffer大于这个数，则可以直接解析
+	// buff不足时，才做一个copy以免解析到越界
 	if (cap >= 10) {
 		len = _pbcV_decode(buffer, &r);
 		if (r.hi !=0)
@@ -29,6 +32,7 @@ wiretype_decode(uint8_t *buffer, int cap , struct atom *a , int start)
 			return NULL;
 	}
 
+	// (field_number << 3) | wire_type.7相当于二进制111，取低3bit
 	int wiretype = r.low & 7;
 	a->wire_id = r.low;
 	buffer += len;
@@ -214,6 +218,7 @@ _pbcC_open_packed(pbc_ctx _ctx, int ptype, void *buffer, int size) {
 	return ctx->number;
 }
 
+// 解析一个pb文件，把pb文件中的message、field全部解析出来放到pbc_ctx的atom数组
 int 
 _pbcC_open(pbc_ctx _ctx , void *buffer, int size) {
 	struct context * ctx = (struct context *)_ctx;
@@ -233,6 +238,8 @@ _pbcC_open(pbc_ctx _ctx , void *buffer, int size) {
 
 	ctx->a = a;
 
+	// 因为在解析之前无法知道pb文件的大小，预先分配的内存为INNER_ATOM
+	// 解析后，如果发现大于则重新再分配
 	for (i=0;i<INNER_ATOM;i++) {
 		if (size == 0)
 			break;
@@ -244,6 +251,7 @@ _pbcC_open(pbc_ctx _ctx , void *buffer, int size) {
 		buffer = next;
 	}
 
+	// 重新分配内存
 	if (size > 0) {
 		int cap = 64;
 		ctx->a = (struct atom *)malloc(cap * sizeof(struct atom));

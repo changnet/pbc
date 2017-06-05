@@ -5,9 +5,11 @@
 
 #include "array.h"
 
+// capacity,预分配的context内存大小
 #define PBC_CONTEXT_CAP 256
 
-// wiretype
+// wiretype,对应protobuf的wire type，见https://developers.google.com/protocol-buffers/docs/encoding
+// 3 4分别为Start group End group，现在已经不用了
 
 #define WT_VARINT 0
 #define WT_BIT64 1
@@ -45,6 +47,7 @@
 #define PTYPE_SINT32   17  // Uses ZigZag encoding.
 #define PTYPE_SINT64   18  // Uses ZigZag encoding.
 
+// 记录一段内存的偏移，真正的内容在context的buffer
 struct slice {
 	int start;
 	int end;
@@ -58,6 +61,11 @@ struct atom {
 	} v;
 };
 
+// 一个descriptor，相当于一个pb文件
+// buffer指整个pb文件的内存
+// size为buffer的大小
+// number为a的数量
+// a为一个数组，数量为number。
 struct context {
 	char * buffer;
 	int size;
