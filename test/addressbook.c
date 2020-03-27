@@ -86,6 +86,23 @@ test_wmessage(struct pbc_env * env)
 	return msg;
 }
 
+void
+test_fields(struct pbc_env *env) {
+	const int max = 16;
+	struct pbc_field *fields = (struct pbc_field *)malloc(sizeof(struct pbc_field) * max);
+
+	int n = pbc_fields(env, "tutorial.Person", fields, max);
+
+	printf("tutorial.Person fields: ");
+	int i = 0;
+	for (;i < n;i ++) {
+		printf("%s(%d) ", fields[i].name, fields[i].id);
+	}
+	printf("\n");
+
+	free(fields);
+}
+
 int
 main()
 {
@@ -101,6 +118,8 @@ main()
 	}
 
 	free(slice.buffer);
+
+	test_fields(env);
 
 	struct pbc_wmessage *msg = test_wmessage(env);
 

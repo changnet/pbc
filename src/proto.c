@@ -9,19 +9,19 @@
 #include <stdlib.h>
 #include <string.h>
 
-const char * 
+const char *
 pbc_error(struct pbc_env * p) {
 	const char *err = p->lasterror;
 	p->lasterror = "";
 	return err;
 }
 
-struct _message * 
+struct _message *
 _pbcP_get_message(struct pbc_env * p , const char *name) {
 	return (struct _message *)_pbcM_sp_query(p->msgs, name);
 }
 
-struct pbc_env * 
+struct pbc_env *
 pbc_new(void) {
 	struct pbc_env * p = (struct pbc_env *)malloc(sizeof(*p));
 	p->files = _pbcM_sp_new(0 , NULL);
@@ -59,7 +59,7 @@ free_msg(void *p) {
 	free(p);
 }
 
-void 
+void
 pbc_delete(struct pbc_env *p) {
 	_pbcM_sp_foreach(p->enums, free_enum);
 	_pbcM_sp_delete(p->enums);
@@ -89,7 +89,7 @@ _pbcP_push_enum(struct pbc_env * p, const char *name, struct map_kv *table, int 
 	return v;
 }
 
-void 
+void
 _pbcP_push_message(struct pbc_env * p, const char *name, struct _field *f , pbc_array queue) {
 	struct _message * m = (struct _message *)_pbcM_sp_query(p->msgs, name);
 	if (m==NULL) {
@@ -103,7 +103,7 @@ _pbcP_push_message(struct pbc_env * p, const char *name, struct _field *f , pbc_
 	}
 	struct _field * field = (struct _field *)malloc(sizeof(*field));
 	memcpy(field,f,sizeof(*f));
-	_pbcM_sp_insert(m->name, field->name, field); 
+	_pbcM_sp_insert(m->name, field->name, field);
 	pbc_var atom;
 	atom->m.buffer = field;
 	if (f->type == PTYPE_MESSAGE || f->type == PTYPE_ENUM) {
@@ -131,7 +131,7 @@ _set_table(void *p, void *ud) {
 	++iter->count;
 }
 
-struct _message * 
+struct _message *
 _pbcP_init_message(struct pbc_env * p, const char *name) {
 	struct _message * m = (struct _message *)_pbcM_sp_query(p->msgs, name);
 	if (m == NULL) {
@@ -162,7 +162,7 @@ _pbcP_init_message(struct pbc_env * p, const char *name) {
 	return m;
 }
 
-int 
+int
 _pbcP_message_default(struct _message * m, const char * name, pbc_var defv) {
 	struct _field * f= (struct _field *)_pbcM_sp_query(m->name, name);
 	if (f==NULL) {
@@ -175,7 +175,7 @@ _pbcP_message_default(struct _message * m, const char * name, pbc_var defv) {
 	return f->type;
 }
 
-int 
+int
 _pbcP_type(struct _field * field, const char ** type) {
 	if (field == NULL) {
 		return 0;
@@ -187,11 +187,11 @@ _pbcP_type(struct _field * field, const char ** type) {
 		ret = PBC_REAL;
 		break;
 	case PTYPE_INT64:
-	case PTYPE_SINT64:  
+	case PTYPE_SINT64:
 		ret = PBC_INT64;
 		break;
 	case PTYPE_INT32:
-	case PTYPE_SINT32:  
+	case PTYPE_SINT32:
 		ret = PBC_INT;
 		break;
 	case PTYPE_UINT32:
@@ -212,7 +212,7 @@ _pbcP_type(struct _field * field, const char ** type) {
 	case PTYPE_STRING:
 		ret = PBC_STRING;
 		break;
-	case PTYPE_BYTES:  
+	case PTYPE_BYTES:
 		ret = PBC_BYTES;
 		break;
 	case PTYPE_ENUM:
@@ -238,7 +238,7 @@ _pbcP_type(struct _field * field, const char ** type) {
 	return ret;
 }
 
-int 
+int
 pbc_type(struct pbc_env * p, const char * type_name , const char * key , const char ** type) {
 	struct _message *m = _pbcP_get_message(p, type_name);
 	if (m==NULL) {
@@ -263,4 +263,52 @@ pbc_enum_id(struct pbc_env *env, const char *enum_type, const char *enum_name) {
 		return -1;
 	}
 	return enum_id;
+}
+
+// from pattern.c
+static int
+_comp_field(const void * a, const void * b) {
+	const struct _field **fa = (const struct _field **)a;
+	const struct _field **fb = (const struct _field **)b;
+
+	return (*fa)->id - (*fb)->id;
+}
+
+int
+pbc_fields(struct pbc_env *env,
+	const char * type_name, struct pbc_field *fields, const int max_field) {
+
+	struct _message *m = _pbcP_get_message(env, type_name);
+	if (m==NULL) {
+		return -1;
+	}
+
+	// 暂时不用malloc，预先分配应该足够
+#define max_tmp 32
+
+	// 遍历所有字段
+	int n = 0;
+	struct _field *field;
+	const char *key = NULL;
+	const struct _field *tmp[max_tmp] = {NULL};
+	while ( (field = (struct _field *)_pbcM_sp_next(m->name, &key)) ) {
+		if (max_field <= n || max_tmp <= n) {
+			return -2;
+		}
+
+		tmp[n++] = field;
+	}
+
+	// 按id排序
+	qsort(tmp, n, sizeof(struct _field *), _comp_field);
+
+	// 只取名字
+	int i;
+	for (i = 0; i < n; i ++) {
+		fields[i].id = tmp[i]->id;
+		fields[i].name = tmp[i]->name;
+	}
+
+	return n;
+#undef max_tmp
 }

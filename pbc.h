@@ -43,6 +43,12 @@ int pbc_register(struct pbc_env *, struct pbc_slice * slice);
 int pbc_type(struct pbc_env *, const char * type_name , const char * key , const char ** type);
 const char * pbc_error(struct pbc_env *);
 
+struct pbc_field {
+	int id;
+	const char *name;
+};
+int pbc_fields(struct pbc_env *, const char * type_name, struct pbc_field *fields, const int max_field);
+
 // callback api
 union pbc_value {
 	struct {
@@ -82,7 +88,7 @@ int pbc_wmessage_string(struct pbc_wmessage *, const char *key, const char * v, 
 struct pbc_wmessage * pbc_wmessage_message(struct pbc_wmessage *, const char *key);
 void * pbc_wmessage_buffer(struct pbc_wmessage *, struct pbc_slice * slice);
 
-// array api 
+// array api
 
 int pbc_array_size(pbc_array);
 uint32_t pbc_array_integer(pbc_array array, int index, uint32_t *hi);
