@@ -15,37 +15,55 @@
 
 #define WMESSAGE_SIZE 64
 
+/* 编码只有一个 buffer：所有子 message 共享 root 的 buffer，遇到子 message
+ * 先写 tag + 长度占位，子层内容直接追加到同一块内存，结束时回写长度。
+ *
+ * 原来的实现是「每个子 message 一个 pbc_wmessage」：每个都要分配 struct、
+ * 64B buffer、pbc_array、512B packed_by_id 并 memset，最后 pbc_wmessage_buffer
+ * 再递归 memcpy 拼回父 buffer。BagUpdate 有 20 个 Item，光这些固定开销就占掉
+ * 编码耗时的一大半。现在子层只是一个 heap bump 出来的轻量视图（无独立 buffer、
+ * 无 memset、无拷贝），与 lua-protobuf 的 pb_addlength 思路一致。
+ *
+ * packed 字段同样直接把 payload 追加进 buffer：begin 写 [tag][长度占位]，
+ * 每元素只编码一次值，end 回写长度。原来要先攒进 pbc_array / map_sp，再在
+ * pbc_wmessage_buffer 里第二趟 _pack_packed_* 重编码，那套结构整体删除。 */
 struct pbc_wmessage {
 	struct _message *type;
-	uint8_t * buffer;
-	uint8_t * ptr;
-	uint8_t * endptr;
-	pbc_array sub;
-	struct map_sp *packed;
-	struct heap * heap;
+	struct pbc_wmessage *root;		/* NULL 表示自己就是 root */
+	struct heap *heap;				/* 由 root 拥有 */
+	uint8_t *buffer;				/* 仅 root 有效 */
+	uint8_t *ptr;
+	uint8_t *endptr;
+	int len_off;					/* 本视图长度占位在 root buffer 中的偏移，root 为 -1 */
+	int packed_len_off;				/* 当前打开的 packed 长度占位偏移，-1 表示没有 */
+	struct _field *packed_f;		/* 当前 packed 字段 */
+	struct pbc_wmessage *open_sub;	/* 本层最近打开、尚未 end 的子视图 */
+	int closed;						/* 视图已回写长度，防止重复 end */
 };
 
-struct _packed {
-	int id;
-	int ptype;
-	pbc_array data;
-};
+static inline struct pbc_wmessage *
+_wm_root(struct pbc_wmessage *m) {
+	return m->root ? m->root : m;
+}
 
 static struct pbc_wmessage *
 _wmessage_new(struct heap *h, struct _message *msg) {
 	struct pbc_wmessage * m = (struct pbc_wmessage *)_pbcH_alloc(h, sizeof(*m));
 	m->type = msg;
+	m->root = NULL;
+	m->heap = h;
 	m->buffer = (uint8_t *)_pbcH_alloc(h, WMESSAGE_SIZE);
 	m->ptr = m->buffer;
 	m->endptr = m->buffer + WMESSAGE_SIZE;
-	_pbcA_open_heap(m->sub, h);
-	m->packed = NULL;
-	m->heap = h;
-
+	m->len_off = -1;
+	m->packed_len_off = -1;
+	m->packed_f = NULL;
+	m->open_sub = NULL;
+	m->closed = 0;
 	return m;
 }
 
-struct pbc_wmessage * 
+struct pbc_wmessage *
 pbc_wmessage_new(struct pbc_env * env, const char *type_name) {
 	struct _message * msg = _pbcP_get_message(env, type_name);
 	if (msg == NULL)
@@ -54,15 +72,37 @@ pbc_wmessage_new(struct pbc_env * env, const char *type_name) {
 	return _wmessage_new(h, msg);
 }
 
-void 
+void
 pbc_wmessage_delete(struct pbc_wmessage *m) {
 	if (m) {
-		_pbcH_delete(m->heap);
+		/* 调用方可能拿的是子视图，heap 归 root 所有 */
+		struct pbc_wmessage *r = _wm_root(m);
+		_pbcH_delete(r->heap);
 	}
 }
 
+struct pbc_wmessage *
+pbc_wmessage_reset(struct pbc_wmessage *m, const char *type_name) {
+	if (m == NULL || type_name == NULL) {
+		return NULL;
+	}
+	/* wmessage 归属于创建它的 env；热更时 binding 会主动 delete 缓存的 wmessage，
+	 * 所以这里的 env 一定是当前 env。 */
+	struct pbc_wmessage *r = _wm_root(m);
+	struct _message * msg = _pbcP_get_message(r->type->env, type_name);
+	if (msg == NULL) {
+		return NULL;
+	}
+	struct heap * h = r->heap;
+	_pbcH_reset(h);
+	return _wmessage_new(h, msg);
+}
+
+/* 扩容会让 buffer 重新分配，所有长度占位都记整数偏移而不是指针，因此重分配
+ * 之后仍然有效。调用方传 root 或子视图都可以。 */
 static void
 _expand_message(struct pbc_wmessage *m, int sz) {
+	m = _wm_root(m);
 	if (m->ptr + sz > m->endptr) {
 		int cap = m->endptr - m->buffer;
 		sz = m->ptr + sz - m->buffer;
@@ -78,38 +118,58 @@ _expand_message(struct pbc_wmessage *m, int sz) {
 	}
 }
 
-static struct _packed *
-_get_packed(struct pbc_wmessage *m , struct _field *f , const char *key) {
-	if (m->packed == NULL) {
-		m->packed = _pbcM_sp_new(4, m->heap);
+/* 回写一处长度占位：占位时只留 1 字节，长度 >= 128 时扩展 varint 并 memmove。
+ * 嵌套是安全的：内层的偏移恒大于外层，memmove 不会动到外层的占位；外层最终
+ * 的 payload 长度用回写瞬间的 ptr 计算，包含内层已回写的长度字节。 */
+static void
+_commit_len(struct pbc_wmessage *m, int off) {
+	struct pbc_wmessage *r = _wm_root(m);
+	int len = (int)(r->ptr - (r->buffer + off + 1));
+	uint8_t temp[10];
+	int need = _pbcV_encode32((uint32_t)len, temp);
+	if (need > 1) {
+		_expand_message(r, need - 1);
+		memmove(r->buffer + off + need,
+			r->buffer + off + 1, (size_t)len);
+		r->ptr += need - 1;
 	}
-	void ** v = _pbcM_sp_query_insert(m->packed , key);
-	if (*v == NULL) {
-		*v = _pbcH_alloc(m->heap, sizeof(struct _packed));
-		struct _packed *p = (struct _packed *)*v;
-		p->id = f->id;
-		p->ptype = f->type;
-		_pbcA_open_heap(p->data, m->heap);
-		return p;
+	memcpy(r->buffer + off, temp, need);
+}
+
+/* 收掉本层尚未结束的子视图与 packed。每次开始写新字段前调用，所以只持有
+ * 「最近一个」子视图就够了：兄弟子消息在下一个 message_f 时自动结束。 */
+static void
+_flush(struct pbc_wmessage *m) {
+	if (m->open_sub) {
+		pbc_wmessage_end_sub(m->open_sub);
+		m->open_sub = NULL;
 	}
-	return (struct _packed *)*v;
+	if (m->packed_len_off >= 0) {
+		_commit_len(m, m->packed_len_off);
+		m->packed_len_off = -1;
+		m->packed_f = NULL;
+	}
+}
+
+/* 只是开始处理一个新字段，不能提交 packed：紧接着的 *_f 可能还是同一个
+ * packed 字段的下一个元素，应当继续追加而不是另起一段。 */
+static void
+_close_open_sub(struct pbc_wmessage *m) {
+	if (m->open_sub) {
+		pbc_wmessage_end_sub(m->open_sub);
+		m->open_sub = NULL;
+	}
 }
 
 static void
-_packed_integer(struct pbc_wmessage *m, struct _field *f, const char *key , uint32_t low, uint32_t hi) {
-	struct _packed * packed = _get_packed(m,f,key);
-	pbc_var var;
-	var->integer.low = low;
-	var->integer.hi = hi;
-	_pbcA_push(packed->data , var);
-}
-
-static void
-_packed_real(struct pbc_wmessage *m, struct _field *f, const char *key , double v) {
-	struct _packed * packed = _get_packed(m,f,key);
-	pbc_var var;
-	var->real = v;
-	_pbcA_push(packed->data , var);
+_begin_packed(struct pbc_wmessage *m, struct _field *f) {
+	struct pbc_wmessage *r = _wm_root(m);
+	int id = f->id << 3 | WT_LEND;
+	_expand_message(r, 20);
+	r->ptr += _pbcV_encode32(id, r->ptr);
+	m->packed_len_off = (int)(r->ptr - r->buffer);
+	*r->ptr++ = 0;
+	m->packed_f = f;
 }
 
 static inline void
@@ -132,18 +192,104 @@ int32_encode(uint32_t low, uint8_t * buffer) {
 	buffer[3] = (uint8_t)(low >> 24 & 0xff);
 }
 
-int 
-pbc_wmessage_integer(struct pbc_wmessage *m, const char *key, uint32_t low, uint32_t hi) {
-	struct _field * f = (struct _field *)_pbcM_sp_query(m->type->name,key);
-	if (f==NULL) {
-		// todo : error
-		m->type->env->lasterror = "wmessage_interger query key error";
+/* packed 单元素：只编码值，不写 tag（tag 在 begin 时已写） */
+static void
+_packed_push_int(struct pbc_wmessage *m, struct _field *f, uint32_t low, uint32_t hi) {
+	struct pbc_wmessage *r = _wm_root(m);
+	_expand_message(r, 10);
+	switch (f->type) {
+	case PTYPE_INT64:
+	case PTYPE_UINT64:
+	case PTYPE_INT32:
+		r->ptr += _pbcV_encode((uint64_t)low | (uint64_t)hi << 32 , r->ptr);
+		break;
+	case PTYPE_UINT32:
+	case PTYPE_ENUM:
+	case PTYPE_BOOL:
+		r->ptr += _pbcV_encode32(low, r->ptr);
+		break;
+	case PTYPE_FIXED64:
+	case PTYPE_SFIXED64:
+		int64_encode(low, hi, r->ptr);
+		r->ptr += 8;
+		break;
+	case PTYPE_FIXED32:
+	case PTYPE_SFIXED32:
+		int32_encode(low, r->ptr);
+		r->ptr += 4;
+		break;
+	case PTYPE_SINT32:
+		r->ptr += _pbcV_zigzag32((int32_t)low, r->ptr);
+		break;
+	case PTYPE_SINT64:
+		r->ptr += _pbcV_zigzag((int64_t)((uint64_t)low | (uint64_t)hi << 32), r->ptr);
+		break;
+	}
+}
+
+static void
+_packed_push_real(struct pbc_wmessage *m, struct _field *f, double v) {
+	struct pbc_wmessage *r = _wm_root(m);
+	_expand_message(r, 10);
+	switch (f->type) {
+	case PTYPE_FLOAT:
+		float_encode((float)v, r->ptr);
+		r->ptr += 4;
+		break;
+	case PTYPE_DOUBLE:
+		double_encode(v, r->ptr);
+		r->ptr += 8;
+		break;
+	}
+}
+
+/* 按 key 解析一次字段，返回不透明句柄。同时收掉上一层未结束的子视图，
+ * 这样「打开子 message -> 回到父层写下一个字段」不需要调用方显式收尾。
+ * 句柄就是 env 拥有的 struct _field*，随 env 只读，可跨调用复用。 */
+struct pbc_wfield *
+pbc_wmessage_field(struct pbc_wmessage *m, const char *key) {
+	if (m == NULL || key == NULL) {
+		return NULL;
+	}
+	_close_open_sub(m);
+	return (struct pbc_wfield *)_pbcM_sp_query(m->type->name, key);
+}
+
+int
+pbc_wmessage_field_type(struct pbc_wfield *wf, const char **type) {
+	if (wf == NULL) {
+		return 0;
+	}
+	return _pbcP_type((struct _field *)wf, type);
+}
+
+int
+pbc_wmessage_field_packed(struct pbc_wfield *wf) {
+	return wf != NULL && ((struct _field *)wf)->label == LABEL_PACKED;
+}
+
+/* ---------------------------------------------------------------------------
+ * 显式字段句柄写入
+ * --------------------------------------------------------------------------- */
+int
+pbc_wmessage_integer_f(struct pbc_wmessage *m, struct pbc_wfield *wf, uint32_t low, uint32_t hi) {
+	struct _field * f = (struct _field *)wf;
+	if (f == NULL) {
+		m->type->env->lasterror = "wmessage_integer invalid field";
 		return -1;
 	}
+	struct pbc_wmessage *r = _wm_root(m);
+
 	if (f->label == LABEL_PACKED) {
-		_packed_integer(m , f, key , low, hi);
-		return 0;		
+		if (m->packed_f != f) {
+			_flush(m);
+			_begin_packed(m, f);
+		}
+		_packed_push_int(m, f, low, hi);
+		return 0;
 	}
+	_flush(m);
+
 	if (f->label == LABEL_OPTIONAL) {
 		if (f->type == PTYPE_ENUM) {
 			if (low == f->default_v->e.id)
@@ -157,45 +303,45 @@ pbc_wmessage_integer(struct pbc_wmessage *m, const char *key, uint32_t low, uint
 	}
 	int id = f->id << 3;
 
-	_expand_message(m,20);
+	_expand_message(r,20);
 	switch (f->type) {
 	case PTYPE_INT64:
-	case PTYPE_UINT64: 
+	case PTYPE_UINT64:
 	case PTYPE_INT32:
 		id |= WT_VARINT;
-		m->ptr += _pbcV_encode32(id, m->ptr);
-		m->ptr += _pbcV_encode((uint64_t)low | (uint64_t)hi << 32 , m->ptr);
+		r->ptr += _pbcV_encode32(id, r->ptr);
+		r->ptr += _pbcV_encode((uint64_t)low | (uint64_t)hi << 32 , r->ptr);
 		break;
 	case PTYPE_UINT32:
 	case PTYPE_ENUM:
 	case PTYPE_BOOL:
 		id |= WT_VARINT;
-		m->ptr += _pbcV_encode32(id, m->ptr);
-		m->ptr += _pbcV_encode32(low, m->ptr);
+		r->ptr += _pbcV_encode32(id, r->ptr);
+		r->ptr += _pbcV_encode32(low, r->ptr);
 		break;
 	case PTYPE_FIXED64:
 	case PTYPE_SFIXED64:
 		id |= WT_BIT64;
-		m->ptr += _pbcV_encode32(id, m->ptr);
-		int64_encode(low,hi,m->ptr);
-		m->ptr += 8;
+		r->ptr += _pbcV_encode32(id, r->ptr);
+		int64_encode(low,hi,r->ptr);
+		r->ptr += 8;
 		break;
 	case PTYPE_FIXED32:
 	case PTYPE_SFIXED32:
 		id |= WT_BIT32;
-		m->ptr += _pbcV_encode32(id, m->ptr);
-		int32_encode(low,m->ptr);
-		m->ptr += 4;
+		r->ptr += _pbcV_encode32(id, r->ptr);
+		int32_encode(low,r->ptr);
+		r->ptr += 4;
 		break;
 	case PTYPE_SINT32:
 		id |= WT_VARINT;
-		m->ptr += _pbcV_encode32(id, m->ptr);
-		m->ptr += _pbcV_zigzag32(low, m->ptr);
+		r->ptr += _pbcV_encode32(id, r->ptr);
+		r->ptr += _pbcV_zigzag32((int32_t)low, r->ptr);
 		break;
 	case PTYPE_SINT64:
 		id |= WT_VARINT;
-		m->ptr += _pbcV_encode32(id, m->ptr);
-		m->ptr += _pbcV_zigzag((uint64_t)low | (uint64_t)hi << 32 , m->ptr);
+		r->ptr += _pbcV_encode32(id, r->ptr);
+		r->ptr += _pbcV_zigzag((int64_t)((uint64_t)low | (uint64_t)hi << 32), r->ptr);
 		break;
 	}
 
@@ -203,37 +349,43 @@ pbc_wmessage_integer(struct pbc_wmessage *m, const char *key, uint32_t low, uint
 }
 
 int
-pbc_wmessage_real(struct pbc_wmessage *m, const char *key, double v) {
-	struct _field * f = (struct _field *)_pbcM_sp_query(m->type->name,key);
+pbc_wmessage_real_f(struct pbc_wmessage *m, struct pbc_wfield *wf, double v) {
+	struct _field * f = (struct _field *)wf;
 	if (f == NULL) {
-		// todo : error
-		m->type->env->lasterror = "wmessage_real query key error";
+		m->type->env->lasterror = "wmessage_real invalid field";
 		return -1;
 	}
+	struct pbc_wmessage *r = _wm_root(m);
+
 	if (f->label == LABEL_PACKED) {
-		_packed_real(m , f, key , v);
-		return 0;		
+		if (m->packed_f != f) {
+			_flush(m);
+			_begin_packed(m, f);
+		}
+		_packed_push_real(m, f, v);
+		return 0;
 	}
+	_flush(m);
 
 	if (f->label == LABEL_OPTIONAL) {
 		if (v == f->default_v->real)
 			return 0;
 	}
 	int id = f->id << 3;
-	_expand_message(m,18);
+	_expand_message(r,18);
 	switch (f->type) {
 	case PTYPE_FLOAT: {
 		id |= WT_BIT32;
-		m->ptr += _pbcV_encode32(id, m->ptr);
-		float_encode(v , m->ptr);
-		m->ptr += 4;
+		r->ptr += _pbcV_encode32(id, r->ptr);
+		float_encode((float)v , r->ptr);
+		r->ptr += 4;
 		break;
 	}
 	case PTYPE_DOUBLE:
 		id |= WT_BIT64;
-		m->ptr += _pbcV_encode32(id, m->ptr);
-		double_encode(v , m->ptr);
-		m->ptr += 8;
+		r->ptr += _pbcV_encode32(id, r->ptr);
+		double_encode(v , r->ptr);
+		r->ptr += 8;
 		break;
 	}
 
@@ -241,13 +393,13 @@ pbc_wmessage_real(struct pbc_wmessage *m, const char *key, double v) {
 }
 
 int
-pbc_wmessage_string(struct pbc_wmessage *m, const char *key, const char * v, int len) {
-	struct _field * f = (struct _field *)_pbcM_sp_query(m->type->name,key);
+pbc_wmessage_string_f(struct pbc_wmessage *m, struct pbc_wfield *wf, const char * v, int len) {
+	struct _field * f = (struct _field *)wf;
 	if (f == NULL) {
-		// todo : error
-		m->type->env->lasterror = "wmessage_string query key error";
+		m->type->env->lasterror = "wmessage_string invalid field";
 		return -1;
 	}
+	struct pbc_wmessage *r = _wm_root(m);
 
 	bool varlen = false;
 
@@ -257,6 +409,7 @@ pbc_wmessage_string(struct pbc_wmessage *m, const char *key, const char * v, int
 		len = strlen(v) - len;
 	}
 	if (f->label == LABEL_PACKED) {
+		/* 只有 enum 名会以字符串形式写进 packed 字段 */
 		if (f->type == PTYPE_ENUM) {
 			char * temp = (char *)alloca(len + 1);
 			if (!varlen || v[len] != '\0') {
@@ -267,14 +420,18 @@ pbc_wmessage_string(struct pbc_wmessage *m, const char *key, const char * v, int
 			int enum_id = 0;
 			int err = _pbcM_si_query(f->type_name.e->name, v , &enum_id);
 			if (err) {
-				// todo : error , invalid enum
 				m->type->env->lasterror = "wmessage_string packed invalid enum";
 				return -1;
 			}
-			_packed_integer(m , f, key , enum_id , 0);
+			if (m->packed_f != f) {
+				_flush(m);
+				_begin_packed(m, f);
+			}
+			_packed_push_int(m, f, (uint32_t)enum_id, 0);
 		}
-		return 0;	
+		return 0;
 	}
+	_flush(m);
 
 	if (f->label == LABEL_OPTIONAL) {
 		if (f->type == PTYPE_ENUM) {
@@ -293,7 +450,7 @@ pbc_wmessage_string(struct pbc_wmessage *m, const char *key, const char * v, int
 		}
 	}
 	int id = f->id << 3;
-	_expand_message(m,20);
+	_expand_message(r,20);
 	switch (f->type) {
 	case PTYPE_ENUM : {
 		char * temp = (char *)alloca(len+1);
@@ -305,214 +462,141 @@ pbc_wmessage_string(struct pbc_wmessage *m, const char *key, const char * v, int
 		int enum_id = 0;
 		int err = _pbcM_si_query(f->type_name.e->name, v, &enum_id);
 		if (err) {
-			// todo : error , enum invalid
 			m->type->env->lasterror = "wmessage_string invalid enum";
 			return -1;
 		}
 		id |= WT_VARINT;
-		m->ptr += _pbcV_encode32(id, m->ptr);
-		m->ptr += _pbcV_encode32(enum_id, m->ptr);
+		r->ptr += _pbcV_encode32(id, r->ptr);
+		r->ptr += _pbcV_encode32(enum_id, r->ptr);
 		break;
 	}
 	case PTYPE_STRING:
 	case PTYPE_BYTES:
 		id |= WT_LEND;
-		m->ptr += _pbcV_encode32(id, m->ptr);
-		m->ptr += _pbcV_encode32(len, m->ptr);
-		_expand_message(m,len);
-		memcpy(m->ptr , v , len);
-		m->ptr += len;
+		r->ptr += _pbcV_encode32(id, r->ptr);
+		r->ptr += _pbcV_encode32(len, r->ptr);
+		_expand_message(r,len);
+		memcpy(r->ptr , v , len);
+		r->ptr += len;
 		break;
 	}
 
 	return 0;
 }
 
-struct pbc_wmessage * 
-pbc_wmessage_message(struct pbc_wmessage *m, const char *key) {
-	struct _field * f = (struct _field *)_pbcM_sp_query(m->type->name,key);
+struct pbc_wmessage *
+pbc_wmessage_message_f(struct pbc_wmessage *m, struct pbc_wfield *wf) {
+	struct _field * f = (struct _field *)wf;
 	if (f == NULL) {
-		// todo : error
-		m->type->env->lasterror = "wmessage_message query key error";
+		m->type->env->lasterror = "wmessage_message invalid field";
 		return NULL;
 	}
-	pbc_var var;
-	var->p[0] = _wmessage_new(m->heap, f->type_name.m);
-	var->p[1] = f;
-	_pbcA_push(m->sub , var);
-	return (struct pbc_wmessage *)var->p[0];
+	struct pbc_wmessage *r = _wm_root(m);
+	_flush(m);
+
+	int id = f->id << 3 | WT_LEND;
+	_expand_message(r, 20);
+	r->ptr += _pbcV_encode32(id, r->ptr);
+	int off = (int)(r->ptr - r->buffer);
+	*r->ptr++ = 0;	/* 1 字节长度占位，end_sub 时按需要扩成多字节 varint */
+
+	struct pbc_wmessage *v = (struct pbc_wmessage *)_pbcH_alloc(r->heap, sizeof(*v));
+	v->type = f->type_name.m;
+	v->root = r;
+	v->heap = r->heap;
+	v->buffer = NULL;
+	v->ptr = NULL;
+	v->endptr = NULL;
+	v->len_off = off;
+	v->packed_len_off = -1;
+	v->packed_f = NULL;
+	v->open_sub = NULL;
+	v->closed = 0;
+	m->open_sub = v;
+	return v;
 }
 
-static void
-_pack_packed_64(struct _packed *p,struct pbc_wmessage *m) {
-	int n = pbc_array_size(p->data);
-	int len = n * 8;
-	int i;
-	pbc_var var;
-	_expand_message(m,10 + len);
-	m->ptr += _pbcV_encode32(len, m->ptr);
-	switch (p->ptype) {
-	case PTYPE_DOUBLE:
-		for (i=0;i<n;i++) {
-			_pbcA_index(p->data, i, var);
-			double_encode(var->real , m->ptr + i * 8);
-		}
-		break;
-	default:
-		for (i=0;i<n;i++) {
-			_pbcA_index(p->data, i, var);
-			int64_encode(var->integer.low , var->integer.hi, m->ptr + i * 8);
-		}
-		break;
+void
+pbc_wmessage_end_sub(struct pbc_wmessage *v) {
+	if (v == NULL || v->root == NULL || v->closed) {
+		return;
 	}
-	m->ptr += len;
+	_flush(v);	/* 递归收掉更深的视图和本层的 packed */
+	_commit_len(v, v->len_off);
+	v->closed = 1;
 }
 
-static void
-_pack_packed_32(struct _packed *p,struct pbc_wmessage *m) {
-	int n = pbc_array_size(p->data);
-	int len = n * 4;
-	int i;
-	pbc_var var;
-	_expand_message(m,10 + len);
-	m->ptr += _pbcV_encode32(len, m->ptr);
-	switch (p->ptype) {
-	case PTYPE_FLOAT:
-		for (i=0;i<n;i++) {
-			_pbcA_index(p->data, i, var);
-			float_encode(var->real , m->ptr + i * 8);
-		}
-		break;
-	default:
-		for (i=0;i<n;i++) {
-			_pbcA_index(p->data, i, var);
-			int32_encode(var->integer.low , m->ptr + i * 8);
-		}
-		break;
+/* ---------------------------------------------------------------------------
+ * packed 批量写入：encode_field_list 识别 packed 后一次 begin / 逐元素 push /
+ * 一次 end，循环里不再走完整的字段类型分派与默认值判断。
+ * --------------------------------------------------------------------------- */
+int
+pbc_wmessage_packed_begin(struct pbc_wmessage *m, struct pbc_wfield *wf) {
+	struct _field *f = (struct _field *)wf;
+	if (f == NULL || f->label != LABEL_PACKED) {
+		return 0;
 	}
-	m->ptr += len;
+	_flush(m);
+	_begin_packed(m, f);
+	return 1;
 }
 
-static void
-_pack_packed_varint(struct _packed *p,struct pbc_wmessage *m) {
-	int n = pbc_array_size(p->data);
-
-	int offset = m->ptr - m->buffer;
-	int len = n * 2;
-	if (p->ptype == PTYPE_BOOL) {
-		len = n;
-	}
-	int i;
-	pbc_var var;
-	_expand_message(m,10 + len);
-	int len_len = _pbcV_encode32(len, m->ptr);
-	m->ptr += len_len;
-
-	switch (p->ptype) {
-	case PTYPE_INT64:
-	case PTYPE_UINT64:
-		for (i=0;i<n;i++) {
-			_pbcA_index(p->data, i, var);
-			_expand_message(m,10);
-			m->ptr += _pbcV_encode((uint64_t)var->integer.low | (uint64_t)var->integer.hi << 32 , m->ptr);
-		}
-		break;
-	case PTYPE_INT32:
-	case PTYPE_BOOL:
-	case PTYPE_UINT32:
-	case PTYPE_ENUM:
-		for (i=0;i<n;i++) {
-			_pbcA_index(p->data, i, var);
-			_expand_message(m,10);
-			m->ptr += _pbcV_encode32(var->integer.low , m->ptr);
-		}
-		break;
-	case PTYPE_SINT32:
-		for (i=0;i<n;i++) {
-			_pbcA_index(p->data, i, var);
-			_expand_message(m,10);
-			m->ptr += _pbcV_zigzag32(var->integer.low, m->ptr);
-		}
-		break;
-	case PTYPE_SINT64:
-		for (i=0;i<n;i++) {
-			_pbcA_index(p->data, i, var);
-			_expand_message(m,10);
-			m->ptr += _pbcV_zigzag((uint64_t)var->integer.low | (uint64_t)var->integer.hi << 32 , m->ptr);
-		}
-		break;
-	default:
-		// error
-		memset(m->ptr , 0 , n);
-		m->ptr += n;
-		m->type->env->lasterror = "wmessage type error when pack packed";
-		break;
-	}
-	int end_offset = m->ptr - m->buffer;
-	int end_len = end_offset - (offset + len_len);
-	if (end_len != len) {
-		uint8_t temp[10];
-		int end_len_len = _pbcV_encode32(end_len, temp);
-		if (end_len_len != len_len) {
-			_expand_message(m, end_len_len);
-			memmove(m->buffer + offset + end_len_len , 
-				m->buffer + offset + len_len , 
-				end_len);
-			m->ptr +=  end_len_len - len_len;
-		}
-		memcpy(m->buffer + offset , temp, end_len_len);
+void
+pbc_wmessage_packed_integer(struct pbc_wmessage *m, struct pbc_wfield *wf, uint32_t low, uint32_t hi) {
+	struct _field *f = m->packed_f ? m->packed_f : (struct _field *)wf;
+	if (f) {
+		_packed_push_int(m, f, low, hi);
 	}
 }
 
-static void
-_pack_packed(void *p, void *ud) {
-	struct _packed *packed = (struct _packed *)p;
-	struct pbc_wmessage * m = (struct pbc_wmessage *)ud;
-	int id = packed->id << 3 | WT_LEND;
-	_expand_message(m,10);
-	m->ptr += _pbcV_encode32(id, m->ptr);
-	switch(packed->ptype) {
-	case PTYPE_DOUBLE:
-	case PTYPE_FIXED64:
-	case PTYPE_SFIXED64:
-		_pack_packed_64(packed,m);
-		break;
-	case PTYPE_FLOAT:
-	case PTYPE_FIXED32:
-	case PTYPE_SFIXED32:
-		_pack_packed_32(packed,m);
-		break;
-	default:
-		_pack_packed_varint(packed,m);
-		break;
+void
+pbc_wmessage_packed_real(struct pbc_wmessage *m, struct pbc_wfield *wf, double v) {
+	struct _field *f = m->packed_f ? m->packed_f : (struct _field *)wf;
+	if (f) {
+		_packed_push_real(m, f, v);
 	}
 }
 
-void * 
+void
+pbc_wmessage_packed_end(struct pbc_wmessage *m) {
+	if (m->packed_len_off >= 0) {
+		_commit_len(m, m->packed_len_off);
+		m->packed_len_off = -1;
+		m->packed_f = NULL;
+	}
+}
+
+/* ---------------------------------------------------------------------------
+ * 兼容层：按 key 写入。内部只多一次字段解析，pbc/binding/lua*、pbc/test
+ * 以及引擎里已有的调用点都不需要改。
+ * --------------------------------------------------------------------------- */
+int
+pbc_wmessage_integer(struct pbc_wmessage *m, const char *key, uint32_t low, uint32_t hi) {
+	return pbc_wmessage_integer_f(m, pbc_wmessage_field(m, key), low, hi);
+}
+
+int
+pbc_wmessage_real(struct pbc_wmessage *m, const char *key, double v) {
+	return pbc_wmessage_real_f(m, pbc_wmessage_field(m, key), v);
+}
+
+int
+pbc_wmessage_string(struct pbc_wmessage *m, const char *key, const char *v, int len) {
+	return pbc_wmessage_string_f(m, pbc_wmessage_field(m, key), v, len);
+}
+
+struct pbc_wmessage *
+pbc_wmessage_message(struct pbc_wmessage *m, const char *key) {
+	return pbc_wmessage_message_f(m, pbc_wmessage_field(m, key));
+}
+
+void *
 pbc_wmessage_buffer(struct pbc_wmessage *m, struct pbc_slice *slice) {
-	if (m->packed) {
-		_pbcM_sp_foreach_ud(m->packed , _pack_packed, m);
-	}
-	int i;
-	int n = pbc_array_size(m->sub);
-	for (i=0;i<n;i++) {
-		pbc_var var;
-		_pbcA_index(m->sub, i , var);
-		struct pbc_slice s;
-		pbc_wmessage_buffer((struct pbc_wmessage *)var->p[0] , &s);
-		if (s.buffer) {
-			struct _field * f = (struct _field *)var->p[1];
-			int id = f->id << 3 | WT_LEND;
-			_expand_message(m,20+s.len);
-			m->ptr += _pbcV_encode32(id, m->ptr);
-			m->ptr += _pbcV_encode32(s.len, m->ptr);
-			memcpy(m->ptr, s.buffer, s.len);
-			m->ptr += s.len;
-		}
-	}
-	slice->buffer = m->buffer;
-	slice->len = m->ptr - m->buffer;
-
-	return m->buffer;
+	struct pbc_wmessage *r = _wm_root(m);
+	/* 递归收掉所有未显式 end 的层：lua binding 只把子视图当 lightuserdata
+	 * 交给 Lua，不会调 end_sub，靠这里和下一次写同层字段自动收尾。 */
+	_flush(r);
+	slice->buffer = r->buffer;
+	slice->len = r->ptr - r->buffer;
+	return r->buffer;
 }
-

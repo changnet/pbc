@@ -254,6 +254,7 @@ _pbc_rmessage_new(struct pbc_rmessage * ret , struct _message * type , void *buf
 	int count = _pbcC_open(_ctx,buffer,size);
 	if (count <= 0) {
 		type->env->lasterror = "rmessage decode context error";
+		_pbcC_close(_ctx);
 		memset(ret , 0, sizeof(*ret));
 		return;
 	}
@@ -280,7 +281,15 @@ _pbc_rmessage_new(struct pbc_rmessage * ret , struct _message * type , void *buf
 				} else {
 					v= (struct value *)*vv;
 				}
-				if (f->label == LABEL_PACKED) {
+				if (f->label == LABEL_PACKED &&
+					(ctx->a[i].wire_id & 7) != WT_LEND) {
+					/* proto3 规范：声明 packed 的字段也必须能接受 unpacked 编码 */
+					push_value_array(h,v->v.array , f, &(ctx->a[i]), (uint8_t *)buffer);
+					if (pbc_array_size(v->v.array) == 0) {
+						type->env->lasterror = "rmessage decode repeated data error";
+						*vv = NULL;
+					}
+				} else if (f->label == LABEL_PACKED) {
 					push_value_packed(type, v->v.array , f , &(ctx->a[i]), (uint8_t *)buffer);
 					if (pbc_array_size(v->v.array) == 0) {
 						type->env->lasterror = "rmessage decode packed data error";

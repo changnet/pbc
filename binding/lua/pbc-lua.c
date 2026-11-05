@@ -317,6 +317,16 @@ _wmessage_message(lua_State *L) {
 	return 1;
 }
 
+/* 子 message 现在与父 wmessage 共享 buffer。不显式调用也能工作（下一次写
+ * 同层字段或 _wmessage_buffer 会自动收尾），但交错持有多个子视图写入时，
+ * 必须用它明确界定每个子消息的边界。 */
+static int
+_wmessage_end_sub(lua_State *L) {
+	struct pbc_wmessage * m = (struct pbc_wmessage *)checkuserdata(L,1);
+	pbc_wmessage_end_sub(m);
+	return 0;
+}
+
 static int
 _wmessage_int32(lua_State *L) {
 	struct pbc_wmessage * m = (struct pbc_wmessage *)checkuserdata(L,1);
@@ -1099,6 +1109,7 @@ luaopen_protobuf_c(lua_State *L) {
 		{"_wmessage_real", _wmessage_real },
 		{"_wmessage_string", _wmessage_string },
 		{"_wmessage_message", _wmessage_message },
+		{"_wmessage_end_sub", _wmessage_end_sub },
 		{"_wmessage_int32", _wmessage_int32 },
 		{"_wmessage_int64", _wmessage_int64 },
 		{"_wmessage_int52", _wmessage_int52 },

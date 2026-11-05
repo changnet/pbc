@@ -62,7 +62,7 @@ struct context {
 	char * buffer;
 	int size;
 	int number;
-	struct atom * a;
+	struct atom * a;	// 内联 atom 用尽时指向 malloc 出来的数组，由 _pbcC_close 释放
 };
 
 typedef struct _pbc_ctx { char _data[PBC_CONTEXT_CAP]; } pbc_ctx[1];
@@ -70,6 +70,10 @@ typedef struct _pbc_ctx { char _data[PBC_CONTEXT_CAP]; } pbc_ctx[1];
 int _pbcC_open(pbc_ctx , void *buffer, int size);	// <=0 failed
 int _pbcC_open_packed(pbc_ctx _ctx, int ptype, void *buffer, int size);
 void _pbcC_close(pbc_ctx);
+
+/* 解析一个 tag 及其负载到 a（a->v.s 是相对 message 起点的偏移）。
+ * 成功返回消耗的字节数，0 表示数据非法。_pbcC_open 与单趟解码共用这一份解析。 */
+int _pbcC_next(void *buffer, int size, struct atom *a, int start);
 
 static inline double
 read_double(struct atom * a) {

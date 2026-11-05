@@ -13,6 +13,29 @@
 #define strtoll _strtoi64
 #endif
 
+/* 语法版本由 pbc.h 的 PBC_SYNTAX_PROTO3 在编译期决定（默认 proto3）。
+ * 不再扫描 FileDescriptorSet.syntax：pbc 没有 per-file 模式，运行时逐文件判断
+ * 既多一趟 wire 扫描，又会把 proto2 自举 descriptor 与 proto3 业务文件混在一个
+ * env 里，语义不明确。混用版本的工程应在编译时选定。 */
+
+#if PBC_SYNTAX_PROTO3
+/* 只有这些标量类型允许 packed；string / bytes / message / group 不行 */
+static int
+_is_packable(int type) {
+	switch (type) {
+	case PTYPE_DOUBLE: case PTYPE_FLOAT:
+	case PTYPE_INT64: case PTYPE_UINT64: case PTYPE_INT32:
+	case PTYPE_FIXED64: case PTYPE_FIXED32:
+	case PTYPE_BOOL: case PTYPE_UINT32: case PTYPE_ENUM:
+	case PTYPE_SFIXED32: case PTYPE_SFIXED64:
+	case PTYPE_SINT32: case PTYPE_SINT64:
+		return 1;
+	default:
+		return 0;
+	}
+}
+#endif
+
 static const char *
 _concat_name(struct _stringpool *p , const char *prefix ,  int prefix_sz , const char *name , int name_sz, int *sz) {
 	if (prefix_sz == 0) {
@@ -132,13 +155,26 @@ _register_field(struct pbc_rmessage * field, struct _field * f, struct _stringpo
 	f->id = pbc_rmessage_integer(field, "number", 0 , 0);
 	f->type = pbc_rmessage_integer(field, "type", 0 , 0);	// enum
 	f->label = pbc_rmessage_integer(field, "label", 0, 0) - 1; // LABEL_OPTIONAL = 0
+	int packed_explicit = 0;
+	int packed_value = 0;
 	if (pbc_rmessage_size(field , "options") > 0) {
 		struct pbc_rmessage * options = pbc_rmessage_message(field, "options" , 0);
-		int packed = pbc_rmessage_integer(options , "packed" , 0 , NULL);
-		if (packed) {
-			f->label = LABEL_PACKED;
+		if (pbc_rmessage_size(options, "packed") > 0) {
+			packed_explicit = 1;
+			packed_value = (int)pbc_rmessage_integer(options , "packed" , 0 , NULL);
 		}
 	}
+	if (packed_explicit) {
+		/* 尊重显式 [packed=true] / [packed=false] */
+		if (packed_value) f->label = LABEL_PACKED;
+		else if (f->label == LABEL_PACKED) f->label = LABEL_REPEATED;
+	}
+#if PBC_SYNTAX_PROTO3
+	else if (f->label == LABEL_REPEATED && _is_packable(f->type)) {
+		/* proto3 默认 packed：descriptor 不写 options.packed 也按 packed 编码 */
+		f->label = LABEL_PACKED;
+	}
+#endif
 	f->type_name.n = pbc_rmessage_string(field, "type_name", 0 , NULL) +1;	// abandon prefix '.' 
 	int vsz;
 	const char * default_value = pbc_rmessage_string(field, "default_value", 0 , &vsz);
@@ -275,7 +311,7 @@ _check_file_name(struct pbc_env * p , struct pbc_rmessage * file, const char ** 
 }
 
 static int
-_register_no_dependency(struct pbc_env * p,struct pbc_rmessage ** files , int n ) {
+_register_no_dependency(struct pbc_env * p,struct pbc_rmessage ** files , int n) {
 	int r = 0;
 	int i;
 	for (i=0;i<n;i++) {
@@ -335,8 +371,12 @@ pbc_register(struct pbc_env * p, struct pbc_slice *slice) {
 	} while (r>0);
 
 	pbc_rmessage_delete(message);
+	/* 注册收尾：一次性预编译所有解码字段缓存，之后 pbc_decode 只读不写 */
+	_pbcP_seal(p);
 	return 0;
 _error:
 	pbc_rmessage_delete(message);
+	/* 失败路径也可能已经注册了部分 message，同样补齐缓存避免解码侧回退 */
+	_pbcP_seal(p);
 	return 1;
 }

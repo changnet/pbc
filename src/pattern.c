@@ -215,16 +215,9 @@ _pbcP_unpack_packed(uint8_t *buffer, int size, int ptype, pbc_array array) {
 	case PTYPE_BOOL: {
 		int n = 0;
 		while (size > 0) {
-			int len;
-			if (size >= 10) {
-				len = _pbcV_decode(buffer, &(var->integer));
-			} else {
-				uint8_t temp[10];
-				memcpy(temp, buffer, size);
-				len = _pbcV_decode(buffer, &(var->integer));
-				if (len > size)
-					return -1;
-			}
+			int len = _pbcV_decode(buffer, size, &(var->integer));
+			if (len == 0)
+				return -1;
 			_pbcA_push(array, var);
 			buffer += len;
 			size -= len;
@@ -235,18 +228,10 @@ _pbcP_unpack_packed(uint8_t *buffer, int size, int ptype, pbc_array array) {
 	case PTYPE_SINT32: {
 		int n = 0;
 		while (size > 0) {
-			int len;
-			if (size >= 10) {
-				len = _pbcV_decode(buffer, &(var->integer));
-				_pbcV_dezigzag32(&(var->integer));
-			} else {
-				uint8_t temp[10];
-				memcpy(temp, buffer, size);
-				len = _pbcV_decode(buffer, &(var->integer));
-				if (len > size)
-					return -1;
-				_pbcV_dezigzag32(&(var->integer));
-			}
+			int len = _pbcV_decode(buffer, size, &(var->integer));
+			if (len == 0)
+				return -1;
+			_pbcV_dezigzag32(&(var->integer));
 			_pbcA_push(array, var);
 			buffer += len;
 			size -= len;
@@ -257,18 +242,10 @@ _pbcP_unpack_packed(uint8_t *buffer, int size, int ptype, pbc_array array) {
 	case PTYPE_SINT64: {
 		int n = 0;
 		while (size > 0) {
-			int len;
-			if (size >= 10) {
-				len = _pbcV_decode(buffer, &(var->integer));
-				_pbcV_dezigzag64(&(var->integer));
-			} else {
-				uint8_t temp[10];
-				memcpy(temp, buffer, size);
-				len = _pbcV_decode(buffer, &(var->integer));
-				if (len > size)
-					return -1;
-				_pbcV_dezigzag64(&(var->integer));
-			}
+			int len = _pbcV_decode(buffer, size, &(var->integer));
+			if (len == 0)
+				return -1;
+			_pbcV_dezigzag64(&(var->integer));
 			_pbcA_push(array, var);
 			buffer += len;
 			size -= len;

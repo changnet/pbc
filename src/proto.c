@@ -5,6 +5,7 @@
 #include "alloc.h"
 #include "stringpool.h"
 #include "bootstrap.h"
+#include "context.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -30,6 +31,8 @@ pbc_new(void) {
 	p->lasterror = "";
 
 	_pbcB_init(p);
+	/* 自举 descriptor 注册完毕，先把内置 message 的解码缓存建好 */
+	_pbcP_seal(p);
 
 	return p;
 }
@@ -53,6 +56,7 @@ free_msg(void *p) {
 	struct _message * m = (struct _message *)p;
 	if (m->id)
 		_pbcM_ip_delete(m->id);
+	free(m->decode_cache);
 	free(m->def);
 	_pbcM_sp_foreach(m->name, free);
 	_pbcM_sp_delete(m->name);
@@ -99,6 +103,9 @@ _pbcP_push_message(struct pbc_env * p, const char *name, struct _field *f , pbc_
 		m->id = NULL;
 		m->name = _pbcM_sp_new(0 , NULL);
 		m->env = p;
+		m->decode_cache = NULL;
+		m->decode_cap = 0;
+		m->field_count = 0;
 		_pbcM_sp_insert(p->msgs, name, m);
 	}
 	struct _field * field = (struct _field *)malloc(sizeof(*field));
@@ -141,6 +148,9 @@ _pbcP_init_message(struct pbc_env * p, const char *name) {
 		m->id = NULL;
 		m->name = _pbcM_sp_new(0 , NULL);
 		m->env = p;
+		m->decode_cache = NULL;
+		m->decode_cap = 0;
+		m->field_count = 0;
 		_pbcM_sp_insert(p->msgs, name, m);
 
 		return m;
@@ -156,6 +166,11 @@ _pbcP_init_message(struct pbc_env * p, const char *name) {
 	_pbcM_sp_foreach_ud(m->name, _set_table, &iter);
 
 	m->id = _pbcM_ip_new(iter.table , iter.count);
+
+	/* 追加注册（扩展字段）会让已有的解码缓存失效，由注册收尾的 _pbcP_seal 重建 */
+	free(m->decode_cache);
+	m->decode_cache = NULL;
+	m->decode_cap = 0;
 
 	free(iter.table);
 
@@ -217,14 +232,15 @@ _pbcP_type(struct _field * field, const char ** type) {
 		break;
 	case PTYPE_ENUM:
 		ret = PBC_ENUM;
+		/* seal 会遍历 env 里全部 message，跨文件依赖未解析时这里可能是 NULL */
 		if (type) {
-			*type = field->type_name.e->key;
+			*type = field->type_name.e ? field->type_name.e->key : NULL;
 		}
 		break;
 	case PTYPE_MESSAGE:
 		ret = PBC_MESSAGE;
 		if (type) {
-			*type = field->type_name.m->key;
+			*type = field->type_name.m ? field->type_name.m->key : NULL;
 		}
 		break;
 	default:
@@ -236,6 +252,89 @@ _pbcP_type(struct _field * field, const char ** type) {
 	}
 
 	return ret;
+}
+
+static int
+_comp_dfield(const void *a, const void *b) {
+	const struct pbc_dfield *x = (const struct pbc_dfield *)a;
+	const struct pbc_dfield *y = (const struct pbc_dfield *)b;
+	return x->pub.id - y->pub.id;
+}
+
+/* 为一个 message 预编译解码字段缓存。只能由 _pbcP_seal 在注册阶段调用：
+ * _pbcB_register_fields 会把 message/enum 字段的 type_name.n（字符串）解析成
+ * type_name.m/e（指针），在此之前 _pbcP_type 会解引用野指针。
+ *
+ * 不再按 max_id 开稀疏数组：容量 = 字段数，与字段号大小无关，也不会因为
+ * 一个很大的 id 就整表退化。解码侧按 id 二分查找，字段数 < 32 时最多 5 次
+ * 整数比较，全部落在 L1。同时把子 message 指针和字段数一起存进来，供
+ * pbc_decode_fast 免查 schema、让 binding 预分配 Lua 表。 */
+static struct pbc_dfield *
+_build_decode_cache(struct _message *m) {
+	if (m->decode_cache)
+		return m->decode_cache;
+	if (m->id == NULL)
+		return NULL;
+
+	struct _iter iter = { 0, NULL };
+	_pbcM_sp_foreach_ud(m->name, _count, &iter);
+	int n = iter.count;
+	m->field_count = n;
+	if (n <= 0)
+		return NULL;
+
+	iter.table = (struct map_kv *)malloc(n * sizeof(struct map_kv));
+	iter.count = 0;
+	_pbcM_sp_foreach_ud(m->name, _set_table, &iter);
+
+	struct pbc_dfield * cache = (struct pbc_dfield *)malloc(n * sizeof(struct pbc_dfield));
+	int used = 0;
+	int i;
+	for (i = 0; i < n; i++) {
+		struct _field * f = (struct _field *)iter.table[i].pointer;
+		const char * type_name = NULL;
+		int type = _pbcP_type(f, &type_name);
+		if (type == 0)
+			continue;
+		cache[used].pub.id = f->id;
+		cache[used].pub.type = type;
+		cache[used].pub.name = f->name;
+		cache[used].pub.type_name = type_name;
+		cache[used].pub.sub = (f->type == PTYPE_MESSAGE && f->type_name.m)
+			? (struct pbc_msg *)f->type_name.m : NULL;
+		cache[used].pub.field_count = n;
+		cache[used].f = f;
+		++used;
+	}
+	free(iter.table);
+	qsort(cache, used, sizeof(*cache), _comp_dfield);
+	m->decode_cache = cache;
+	m->decode_cap = used;
+	return cache;
+}
+
+struct pbc_msg *
+pbc_msg_from_name(struct pbc_env *p, const char *type_name) {
+	return (struct pbc_msg *)_pbcP_get_message(p, type_name);
+}
+
+int
+pbc_msg_field_count(struct pbc_msg *m) {
+	return m ? ((struct _message *)m)->field_count : 0;
+}
+
+/* 注册收尾：把 env 里所有还没建缓存的 message 一次性建好。
+ * 追加注册（扩展字段）会在 _pbcP_init_message 里清掉旧缓存，这里负责重建。
+ * 整个过程只在加载 pb / 热更建新 env 时发生，解码侧完全只读。 */
+static void
+_seal_one(void *p, void *ud) {
+	(void)ud;
+	_build_decode_cache((struct _message *)p);
+}
+
+void
+_pbcP_seal(struct pbc_env *p) {
+	_pbcM_sp_foreach_ud(p->msgs, _seal_one, NULL);
 }
 
 int

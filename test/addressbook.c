@@ -72,10 +72,13 @@ test_wmessage(struct pbc_env * env)
 
 	struct pbc_wmessage * phone = pbc_wmessage_message(msg , "phone");
 	pbc_wmessage_string(phone , "number", "87654321" , -1);
+	/* 共享 buffer 的子视图写完就回写长度，不依赖自动收尾 */
+	pbc_wmessage_end_sub(phone);
 
 	phone = pbc_wmessage_message(msg , "phone");
 	pbc_wmessage_string(phone , "number", "13901234567" , -1);
 	pbc_wmessage_string(phone , "type" , "MOBILE" , -1);
+	pbc_wmessage_end_sub(phone);
 
 	pbc_wmessage_integer(msg, "test", -123,0);
 	pbc_wmessage_integer(msg, "test", 12345,0);

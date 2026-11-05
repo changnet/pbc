@@ -48,35 +48,30 @@ _pbcV_encode(uint64_t number, uint8_t buffer[10])
 }
 
 int
-_pbcV_decode(uint8_t buffer[10], struct longlong *result) {
-	if (!(buffer[0] & 0x80)) {
-		result->low = buffer[0];
-		result->hi = 0;
-		return 1;
+_pbcV_decode(const uint8_t *buffer, int size, struct longlong *result) {
+	result->low = 0;
+	result->hi = 0;
+	if (buffer == NULL || size <= 0) {
+		return 0;
 	}
-	uint32_t r = buffer[0] & 0x7f;
+
+	/* varint 最长 10 字节，超过部分不读也不属于本字段 */
+	int n = size < 10 ? size : 10;
+	uint64_t v = 0;
 	int i;
-	for (i=1;i<4;i++) {
-		r |= ((buffer[i]&0x7f) << (7*i));
-		if (!(buffer[i] & 0x80)) {
-			result->low = r;
-			result->hi = 0;
-			return i+1;
-		}
-	}
-	uint64_t lr = 0;
-	for (i=4;i<10;i++) {
-		lr |= ((uint64_t)(buffer[i] & 0x7f) << (7*(i-4)));
-		if (!(buffer[i] & 0x80)) {
-			result->hi = (uint32_t)(lr >> 4);
-			result->low = r | (((uint32_t)lr & 0xf) << 28);
-			return i+1;
+	for (i = 0; i < n; ++i) {
+		uint8_t b = buffer[i];
+		v |= (uint64_t)(b & 0x7f) << (7 * i);
+		if (!(b & 0x80)) {
+			/* 与原实现等价：低 32 位进 low，高 32 位进 hi */
+			result->low = (uint32_t)v;
+			result->hi = (uint32_t)(v >> 32);
+			return i + 1;
 		}
 	}
 
-	result->low = 0;
-	result->hi = 0;
-	return 10;
+	/* 10 字节全是 continuation，或 varint 在本段数据内被截断 */
+	return 0;
 }
 
 int 

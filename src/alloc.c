@@ -61,6 +61,26 @@ _pbcH_delete(struct heap *h) {
 	_pbcM_free(h);
 }
 
+void
+_pbcH_reset(struct heap *h) {
+	/* _pbcH_alloc 把新 page 头插到 current，因此链表尾就是最初分配的 page，
+	 * wmessage 对象与 WMESSAGE_SIZE 初始 buffer 都位于该 page 的起始处。 */
+	struct heap_page * tail = h->current;
+	while (tail->next != NULL) {
+		tail = tail->next;
+	}
+	struct heap_page * p = h->current;
+	while (p != tail) {
+		struct heap_page * next = p->next;
+		_pbcM_free(p);
+		p = next;
+	}
+	tail->next = NULL;
+	h->current = tail;
+	h->used = 0;
+	/* h->size 在 _pbcH_alloc 中从不改写，恒等于首 page 的容量，保持不变 */
+}
+
 void* 
 _pbcH_alloc(struct heap *h, int size) {
 	size = (size + 3) & ~3;
