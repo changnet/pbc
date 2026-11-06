@@ -18,12 +18,6 @@
 /* 编码只有一个 buffer：所有子 message 共享 root 的 buffer，遇到子 message
  * 先写 tag + 长度占位，子层内容直接追加到同一块内存，结束时回写长度。
  *
- * 原来的实现是「每个子 message 一个 pbc_wmessage」：每个都要分配 struct、
- * 64B buffer、pbc_array、512B packed_by_id 并 memset，最后 pbc_wmessage_buffer
- * 再递归 memcpy 拼回父 buffer。BagUpdate 有 20 个 Item，光这些固定开销就占掉
- * 编码耗时的一大半。现在子层只是一个 heap bump 出来的轻量视图（无独立 buffer、
- * 无 memset、无拷贝），与 lua-protobuf 的 pb_addlength 思路一致。
- *
  * packed 字段同样直接把 payload 追加进 buffer：begin 写 [tag][长度占位]，
  * 每元素只编码一次值，end 回写长度。原来要先攒进 pbc_array / map_sp，再在
  * pbc_wmessage_buffer 里第二趟 _pack_packed_* 重编码，那套结构整体删除。 */
@@ -82,6 +76,16 @@ pbc_wmessage_delete(struct pbc_wmessage *m) {
 }
 
 struct pbc_wmessage *
+pbc_wmessage_reset_msg(struct pbc_wmessage *m, struct pbc_msg *msg) {
+	if (m == NULL || msg == NULL) {
+		return NULL;
+	}
+	struct heap * h = _wm_root(m)->heap;
+	_pbcH_reset(h);
+	return _wmessage_new(h, (struct _message *)msg);
+}
+
+struct pbc_wmessage *
 pbc_wmessage_reset(struct pbc_wmessage *m, const char *type_name) {
 	if (m == NULL || type_name == NULL) {
 		return NULL;
@@ -89,13 +93,7 @@ pbc_wmessage_reset(struct pbc_wmessage *m, const char *type_name) {
 	/* wmessage 归属于创建它的 env；热更时 binding 会主动 delete 缓存的 wmessage，
 	 * 所以这里的 env 一定是当前 env。 */
 	struct pbc_wmessage *r = _wm_root(m);
-	struct _message * msg = _pbcP_get_message(r->type->env, type_name);
-	if (msg == NULL) {
-		return NULL;
-	}
-	struct heap * h = r->heap;
-	_pbcH_reset(h);
-	return _wmessage_new(h, msg);
+	return pbc_wmessage_reset_msg(r, (struct pbc_msg *)_pbcP_get_message(r->type->env, type_name));
 }
 
 /* 扩容会让 buffer 重新分配，所有长度占位都记整数偏移而不是指针，因此重分配
@@ -137,7 +135,8 @@ _commit_len(struct pbc_wmessage *m, int off) {
 }
 
 /* 收掉本层尚未结束的子视图与 packed。每次开始写新字段前调用，所以只持有
- * 「最近一个」子视图就够了：兄弟子消息在下一个 message_f 时自动结束。 */
+ * 「最近一个」子视图就够了：兄弟子消息在下一个 message_f 时自动结束。
+ * 所有写入入口最终都会走到这里，因此不需要另外在查字段时再收一遍。 */
 static void
 _flush(struct pbc_wmessage *m) {
 	if (m->open_sub) {
@@ -148,16 +147,6 @@ _flush(struct pbc_wmessage *m) {
 		_commit_len(m, m->packed_len_off);
 		m->packed_len_off = -1;
 		m->packed_f = NULL;
-	}
-}
-
-/* 只是开始处理一个新字段，不能提交 packed：紧接着的 *_f 可能还是同一个
- * packed 字段的下一个元素，应当继续追加而不是另起一段。 */
-static void
-_close_open_sub(struct pbc_wmessage *m) {
-	if (m->open_sub) {
-		pbc_wmessage_end_sub(m->open_sub);
-		m->open_sub = NULL;
 	}
 }
 
@@ -243,29 +232,25 @@ _packed_push_real(struct pbc_wmessage *m, struct _field *f, double v) {
 	}
 }
 
-/* 按 key 解析一次字段，返回不透明句柄。同时收掉上一层未结束的子视图，
- * 这样「打开子 message -> 回到父层写下一个字段」不需要调用方显式收尾。
- * 句柄就是 env 拥有的 struct _field*，随 env 只读，可跨调用复用。 */
+/* 按 key 解析一次字段，返回不透明句柄。句柄就是 env 拥有的 struct _field*，
+ * 随 env 只读，可跨调用复用。紧接其后的 *_f 会先 _flush，所以这里不需要
+ * 主动收上一层未结束的子视图。 */
 struct pbc_wfield *
 pbc_wmessage_field(struct pbc_wmessage *m, const char *key) {
 	if (m == NULL || key == NULL) {
 		return NULL;
 	}
-	_close_open_sub(m);
 	return (struct pbc_wfield *)_pbcM_sp_query(m->type->name, key);
 }
 
-int
-pbc_wmessage_field_type(struct pbc_wfield *wf, const char **type) {
-	if (wf == NULL) {
-		return 0;
+/* 由 seal 阶段预编译的字段元数据直接取句柄：pub 是 pbc_dfield 的首成员，
+ * 地址相同，回转就是一次减法，不做任何查询。 */
+struct pbc_wfield *
+pbc_wmessage_field_at(struct pbc_wmessage *m, const struct pbc_ffield *ff) {
+	if (m == NULL || ff == NULL) {
+		return NULL;
 	}
-	return _pbcP_type((struct _field *)wf, type);
-}
-
-int
-pbc_wmessage_field_packed(struct pbc_wfield *wf) {
-	return wf != NULL && ((struct _field *)wf)->label == LABEL_PACKED;
+	return (struct pbc_wfield *)((const struct pbc_dfield *)ff)->f;
 }
 
 /* ---------------------------------------------------------------------------

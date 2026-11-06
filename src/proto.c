@@ -210,12 +210,19 @@ _pbcP_type(struct _field * field, const char ** type) {
 		ret = PBC_INT;
 		break;
 	case PTYPE_UINT32:
+		/* 拆开是必须的：uint32 与 fixed32 都是无符号，而 sfixed32 是有符号。
+		 * 三者以前共用 PBC_UINT / PBC_FIXED32，解码侧只能一律按 int32 推给 Lua，
+		 * 结果 0x80000000 以上的值全变成负数。 */
+		ret = PBC_UINT32;
+		break;
 	case PTYPE_UINT64:
 		ret = PBC_UINT;
 		break;
 	case PTYPE_FIXED32:
-	case PTYPE_SFIXED32:
 		ret = PBC_FIXED32;
+		break;
+	case PTYPE_SFIXED32:
+		ret = PBC_SFIXED32;
 		break;
 	case PTYPE_SFIXED64:
 	case PTYPE_FIXED64:
@@ -267,8 +274,8 @@ _comp_dfield(const void *a, const void *b) {
  *
  * 不再按 max_id 开稀疏数组：容量 = 字段数，与字段号大小无关，也不会因为
  * 一个很大的 id 就整表退化。解码侧按 id 二分查找，字段数 < 32 时最多 5 次
- * 整数比较，全部落在 L1。同时把子 message 指针和字段数一起存进来，供
- * pbc_decode_fast 免查 schema、让 binding 预分配 Lua 表。 */
+ * 整数比较，全部落在 L1。同时把子 message 指针一起存进来：解码侧免查 schema，
+ * 编码侧靠同一张表正向遍历字段。 */
 static struct pbc_dfield *
 _build_decode_cache(struct _message *m) {
 	if (m->decode_cache)
@@ -302,7 +309,6 @@ _build_decode_cache(struct _message *m) {
 		cache[used].pub.type_name = type_name;
 		cache[used].pub.sub = (f->type == PTYPE_MESSAGE && f->type_name.m)
 			? (struct pbc_msg *)f->type_name.m : NULL;
-		cache[used].pub.field_count = n;
 		cache[used].f = f;
 		++used;
 	}
@@ -321,6 +327,28 @@ pbc_msg_from_name(struct pbc_env *p, const char *type_name) {
 int
 pbc_msg_field_count(struct pbc_msg *m) {
 	return m ? ((struct _message *)m)->field_count : 0;
+}
+
+const char *
+pbc_msg_key(struct pbc_msg *m) {
+	return m ? ((struct _message *)m)->key : NULL;
+}
+
+/* schema 遍历用的两个只读访问器：字段表按 id 升序，容量只与字段数有关。
+ * 注意 decode_cap <= field_count：_pbcP_type 返回 0 的字段（依赖未解析、
+ * 未知类型）在 seal 阶段就被跳过了，遍历边界必须用 cap。 */
+int
+pbc_msg_field_cap(struct pbc_msg *m) {
+	return m ? ((struct _message *)m)->decode_cap : 0;
+}
+
+const struct pbc_ffield *
+pbc_msg_field_at(struct pbc_msg *m, int i) {
+	struct _message *mm = (struct _message *)m;
+	if (mm == NULL || mm->decode_cache == NULL || i < 0 || i >= mm->decode_cap) {
+		return NULL;
+	}
+	return &mm->decode_cache[i].pub;
 }
 
 /* 注册收尾：把 env 里所有还没建缓存的 message 一次性建好。
@@ -362,52 +390,4 @@ pbc_enum_id(struct pbc_env *env, const char *enum_type, const char *enum_name) {
 		return -1;
 	}
 	return enum_id;
-}
-
-// from pattern.c
-static int
-_comp_field(const void * a, const void * b) {
-	const struct _field **fa = (const struct _field **)a;
-	const struct _field **fb = (const struct _field **)b;
-
-	return (*fa)->id - (*fb)->id;
-}
-
-int
-pbc_fields(struct pbc_env *env,
-	const char * type_name, struct pbc_field *fields, const int max_field) {
-
-	struct _message *m = _pbcP_get_message(env, type_name);
-	if (m==NULL) {
-		return -1;
-	}
-
-	// 暂时不用malloc，预先分配应该足够
-#define max_tmp 32
-
-	// 遍历所有字段
-	int n = 0;
-	struct _field *field;
-	const char *key = NULL;
-	const struct _field *tmp[max_tmp] = {NULL};
-	while ( (field = (struct _field *)_pbcM_sp_next(m->name, &key)) ) {
-		if (max_field <= n || max_tmp <= n) {
-			return -2;
-		}
-
-		tmp[n++] = field;
-	}
-
-	// 按id排序
-	qsort(tmp, n, sizeof(struct _field *), _comp_field);
-
-	// 只取名字
-	int i;
-	for (i = 0; i < n; i ++) {
-		fields[i].id = tmp[i]->id;
-		fields[i].name = tmp[i]->name;
-	}
-
-	return n;
-#undef max_tmp
 }

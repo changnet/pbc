@@ -105,7 +105,7 @@ call_type(pbc_decoder pd, void * ud, struct _field *f, struct atom *a, uint8_t *
 		v.i.low = a->v.i.low;
 		v.i.hi = 0;
 		break;
-	case PTYPE_SINT32: 
+	case PTYPE_SINT32:
 		CHECK_VARINT(a, -1);
 		v.i.low = a->v.i.low;
 		v.i.hi = a->v.i.hi;
@@ -269,8 +269,7 @@ call_array(pbc_decoder pd, void * ud, struct _field *f, uint8_t * buffer , int s
 	}
 }
 
-/* 紧凑缓存按 field id 升序排列，二分查找。字段数通常 < 32，最多 5 次比较。
- * 容量只与字段数有关，id 再大也不会退化成稀疏大表。 */
+/* 紧凑缓存按 field id 升序排列，二分查找。字段数通常 < 32，最多 5 次比较。比hash快 */
 static struct pbc_dfield *
 _pbcP_find_dfield(struct pbc_dfield *cache, int n, int id) {
 	int lo = 0;
@@ -435,14 +434,9 @@ _dezigzag64(uint64_t n) {
 	return (int64_t)(n >> 1) ^ -(int64_t)(n & 1);
 }
 
-static const char *
-_enum_name(struct _field *f, uint64_t id) {
-	if (f->type_name.e == NULL || f->type_name.e->id == NULL)
-		return NULL;
-	return (const char *)_pbcM_ip_query(f->type_name.e->id, (int)(uint32_t)id);
-}
-
-/* 单个（非 packed）字段：把 tag 之后已经读出的负载转成紧凑值 */
+/* 单个（非 packed）字段：把 tag 之后已经读出的负载转成紧凑值。
+ * enum 一律按整数值交给上层（proto 的 enum 在 wire 上就是 varint），
+ * binding 侧不需要再和整数/字符串两种形态打交道。 */
 static void
 _fill_value(struct _field *f, uint64_t iv, const uint8_t *data, int len,
 		struct pbc_fvalue *v) {
@@ -467,10 +461,6 @@ _fill_value(struct _field *f, uint64_t iv, const uint8_t *data, int len,
 		break;
 	case PTYPE_SINT64:
 		v->i = (uint64_t)_dezigzag64(iv);
-		break;
-	case PTYPE_ENUM:
-		v->i = iv;
-		v->ename = _enum_name(f, iv);
 		break;
 	case PTYPE_STRING:
 	case PTYPE_BYTES:
@@ -523,10 +513,6 @@ _fill_packed_one(struct _field *f, const uint8_t **q, const uint8_t *end,
 			break;
 		case PTYPE_SINT64:
 			v->i = (uint64_t)_dezigzag64(x);
-			break;
-		case PTYPE_ENUM:
-			v->i = x;
-			v->ename = _enum_name(f, x);
 			break;
 		default:
 			v->i = x;
@@ -631,11 +617,9 @@ pbc_decode_fast_msg(struct pbc_msg *m_, struct pbc_slice *slice,
 				int count = _count_packed(f, data, data + data_len);
 				const uint8_t *q = data;
 				const uint8_t *qe = data + data_len;
-				int idx = 0;
 				while (q < qe) {
 					if (_fill_packed_one(f, &q, qe, &v) != 0)
 						return -1;
-					v.index = ++idx;
 					v.count = count;
 					if (cb(ud, &dc->pub, &v) != 0)
 						return -1;
@@ -651,15 +635,4 @@ pbc_decode_fast_msg(struct pbc_msg *m_, struct pbc_slice *slice,
 		++number;
 	}
 	return number;
-}
-
-int
-pbc_decode_fast(struct pbc_env *env, const char *type_name,
-		struct pbc_slice *slice, pbc_fast_decoder cb, void *ud) {
-	struct pbc_msg *m = pbc_msg_from_name(env, type_name);
-	if (m == NULL) {
-		env->lasterror = "Proto not found";
-		return -1;
-	}
-	return pbc_decode_fast_msg(m, slice, cb, ud);
 }

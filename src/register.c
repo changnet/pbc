@@ -13,10 +13,7 @@
 #define strtoll _strtoi64
 #endif
 
-/* 语法版本由 pbc.h 的 PBC_SYNTAX_PROTO3 在编译期决定（默认 proto3）。
- * 不再扫描 FileDescriptorSet.syntax：pbc 没有 per-file 模式，运行时逐文件判断
- * 既多一趟 wire 扫描，又会把 proto2 自举 descriptor 与 proto3 业务文件混在一个
- * env 里，语义不明确。混用版本的工程应在编译时选定。 */
+/* 语法版本由 pbc.h 的 PBC_SYNTAX_PROTO3 在编译期决定（默认 proto3） */
 
 #if PBC_SYNTAX_PROTO3
 /* 只有这些标量类型允许 packed；string / bytes / message / group 不行 */
@@ -175,7 +172,7 @@ _register_field(struct pbc_rmessage * field, struct _field * f, struct _stringpo
 		f->label = LABEL_PACKED;
 	}
 #endif
-	f->type_name.n = pbc_rmessage_string(field, "type_name", 0 , NULL) +1;	// abandon prefix '.' 
+	f->type_name.n = pbc_rmessage_string(field, "type_name", 0 , NULL) +1;	// abandon prefix '.'
 	int vsz;
 	const char * default_value = pbc_rmessage_string(field, "default_value", 0 , &vsz);
 	_set_default(pool , f , f->type, default_value , vsz);
@@ -184,7 +181,7 @@ _register_field(struct pbc_rmessage * field, struct _field * f, struct _stringpo
 static void
 _register_extension(struct pbc_env *p, struct _stringpool *pool , const char * prefix, int prefix_sz, struct pbc_rmessage * msg, pbc_array queue) {
 	int extension_count = pbc_rmessage_size(msg , "extension");
-	if (extension_count <= 0) 
+	if (extension_count <= 0)
 		return;
 	int i;
 
@@ -208,7 +205,7 @@ _register_extension(struct pbc_env *p, struct _stringpool *pool , const char * p
 		} else if (strcmp(extendee,last) != 0) {
 			_pbcP_init_message(p, last+1);
 			last = extendee;
-		} 
+		}
 	}
 	_pbcP_init_message(p, last+1);
 }
@@ -246,7 +243,7 @@ _register_message(struct pbc_env *p, struct _stringpool *pool, struct pbc_rmessa
 		struct pbc_rmessage * enum_type = pbc_rmessage_message(message_type, "enum_type", i);
 		_register_enum(p, pool, enum_type, temp, sz);
 	}
-	
+
 	// nested type
 	int message_count = pbc_rmessage_size(message_type, "nested_type");
 	for (i=0;i<message_count;i++) {
@@ -295,7 +292,7 @@ _check_file_name(struct pbc_env * p , struct pbc_rmessage * file, const char ** 
 	if (_pbcM_sp_query(p->files, filename)) {
 		return CHECK_FILE_EXIST;
 	}
-	int sz = pbc_rmessage_size(file, "dependency"); 
+	int sz = pbc_rmessage_size(file, "dependency");
 	int i;
 	for (i=0;i<sz;i++) {
 		const char *dname = pbc_rmessage_string(file,"dependency",i,NULL);

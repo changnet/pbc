@@ -91,19 +91,17 @@ test_wmessage(struct pbc_env * env)
 
 void
 test_fields(struct pbc_env *env) {
-	const int max = 16;
-	struct pbc_field *fields = (struct pbc_field *)malloc(sizeof(struct pbc_field) * max);
-
-	int n = pbc_fields(env, "tutorial.Person", fields, max);
+	/* 直接读 seal 阶段预编译的字段表：按 field id 升序，容量只与字段数有关，
+	 * 不再受调用方预留数组大小限制 */
+	struct pbc_msg *m = pbc_msg_from_name(env, "tutorial.Person");
 
 	printf("tutorial.Person fields: ");
-	int i = 0;
-	for (;i < n;i ++) {
-		printf("%s(%d) ", fields[i].name, fields[i].id);
+	int i;
+	for (i = 0; i < pbc_msg_field_cap(m); i++) {
+		const struct pbc_ffield *f = pbc_msg_field_at(m, i);
+		printf("%s(%d) ", f->name, f->id);
 	}
 	printf("\n");
-
-	free(fields);
 }
 
 int
