@@ -219,6 +219,11 @@ _register_message(struct pbc_env *p, struct _stringpool *pool, struct pbc_rmessa
 
 	int field_count = pbc_rmessage_size(message_type, "field");
 	int i;
+	/* protoc 把 map<k,v> 编译成嵌套的 XxxEntry 消息：恰好两个字段 key=1 / value=2。
+	 * 自举用的 descriptor 是 protobuf 2.x 版本，读不到 options.map_entry，
+	 * 因此按生成物的固定结构 + Entry 后缀来识别。 */
+	int entry_ids[2] = { 0, 0 };
+	const char * entry_names[2] = { NULL, NULL };
 	for (i=0;i<field_count;i++) {
 		struct pbc_rmessage * field = pbc_rmessage_message(message_type, "field" , i);
 		struct _field f;
@@ -228,10 +233,20 @@ _register_message(struct pbc_env *p, struct _stringpool *pool, struct pbc_rmessa
 
 		_register_field(field, &f , pool);
 
+		if (i < 2) {
+			entry_ids[i] = f.id;
+			entry_names[i] = f.name;
+		}
 		_pbcP_push_message(p, temp , &f , queue);
 	}
 
-	_pbcP_init_message(p, temp);
+	struct _message * self = _pbcP_init_message(p, temp);
+	if (field_count == 2 && entry_ids[0] == 1 && entry_ids[1] == 2 &&
+		strcmp(entry_names[0], "key") == 0 &&
+		strcmp(entry_names[1], "value") == 0 &&
+		name_sz >= 5 && memcmp(name + name_sz - 5, "Entry", 5) == 0) {
+		self->is_map_entry = 1;
+	}
 
 	_register_extension(p, pool, temp, sz,message_type, queue);
 

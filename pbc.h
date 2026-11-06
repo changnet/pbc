@@ -88,6 +88,7 @@ struct pbc_ffield {
 	const char *name;			/* interned 字段名 */
 	const char *type_name;		/* enum/message 的类型名，其余为 NULL */
 	struct pbc_msg *sub;		/* PBC_MESSAGE 时按指针直达子 message */
+	int is_map;					/* proto3 map：repeated MapEntry，binding 需做 kv 转换 */
 };
 
 struct pbc_fvalue {

@@ -52,6 +52,7 @@ struct _message {
 	struct pbc_dfield * decode_cache;	// 按 field id 升序，NULL 表示未构建
 	int decode_cap;		// 缓存元素个数（不是数组下标上限）
 	int field_count;	// 字段数，供 binding 预分配 Lua 表
+	int is_map_entry;	// protoc 为 map<k,v> 生成的嵌套 MapEntry 消息
 };
 
 struct _enum {

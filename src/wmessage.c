@@ -275,7 +275,9 @@ pbc_wmessage_integer_f(struct pbc_wmessage *m, struct pbc_wfield *wf, uint32_t l
 	}
 	_flush(m);
 
-	if (f->label == LABEL_OPTIONAL) {
+	/* proto3 单值字段等于默认值时不写；map entry 的 key/value 仍显式写出，
+	 * 与 C++/Java/Python 一致，不依赖对端「缺失字段补默认值」还原空 entry。 */
+	if (f->label == LABEL_OPTIONAL && !m->type->is_map_entry) {
 		if (f->type == PTYPE_ENUM) {
 			if (low == f->default_v->e.id)
 				return 0;
@@ -352,7 +354,8 @@ pbc_wmessage_real_f(struct pbc_wmessage *m, struct pbc_wfield *wf, double v) {
 	}
 	_flush(m);
 
-	if (f->label == LABEL_OPTIONAL) {
+	/* 同 integer_f：map entry 的默认值字段也写出 */
+	if (f->label == LABEL_OPTIONAL && !m->type->is_map_entry) {
 		if (v == f->default_v->real)
 			return 0;
 	}
@@ -418,7 +421,8 @@ pbc_wmessage_string_f(struct pbc_wmessage *m, struct pbc_wfield *wf, const char 
 	}
 	_flush(m);
 
-	if (f->label == LABEL_OPTIONAL) {
+	/* 同 integer_f：map entry 的默认值字段也写出 */
+	if (f->label == LABEL_OPTIONAL && !m->type->is_map_entry) {
 		if (f->type == PTYPE_ENUM) {
 			if (strncmp(v , f->default_v->e.name, len) == 0 && f->default_v->e.name[len] =='\0') {
 				return 0;

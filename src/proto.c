@@ -106,6 +106,7 @@ _pbcP_push_message(struct pbc_env * p, const char *name, struct _field *f , pbc_
 		m->decode_cache = NULL;
 		m->decode_cap = 0;
 		m->field_count = 0;
+		m->is_map_entry = 0;
 		_pbcM_sp_insert(p->msgs, name, m);
 	}
 	struct _field * field = (struct _field *)malloc(sizeof(*field));
@@ -151,6 +152,7 @@ _pbcP_init_message(struct pbc_env * p, const char *name) {
 		m->decode_cache = NULL;
 		m->decode_cap = 0;
 		m->field_count = 0;
+		m->is_map_entry = 0;
 		_pbcM_sp_insert(p->msgs, name, m);
 
 		return m;
@@ -309,6 +311,11 @@ _build_decode_cache(struct _message *m) {
 		cache[used].pub.type_name = type_name;
 		cache[used].pub.sub = (f->type == PTYPE_MESSAGE && f->type_name.m)
 			? (struct pbc_msg *)f->type_name.m : NULL;
+		/* proto3 map：repeated 字段指向注册阶段识别出的 MapEntry 嵌套消息，
+		 * binding 据此把 Lua kv table 与 MapEntry 数组互相转换。 */
+		cache[used].pub.is_map = (cache[used].pub.sub &&
+			f->label == LABEL_REPEATED &&
+			((struct _message *)cache[used].pub.sub)->is_map_entry) ? 1 : 0;
 		cache[used].f = f;
 		++used;
 	}
